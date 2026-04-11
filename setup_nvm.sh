@@ -4,7 +4,7 @@
 # Script Name: setup_nvm.sh
 # Description: NVM configuration script
 # OS: Linux_x86_64, Linux_arm64, macOS_x86_64, macOS_arm64
-# Date: 2025-12-25
+# Date: 2026-04-11
 # =================================================================
 
 set -e
@@ -49,7 +49,13 @@ install_nvm() {
         git -C "$INSTALL_DIR" checkout "$NVM_VERSION" --quiet
     fi
 
-    # 5. Configure environment variables
+    # 5. Configure shared npm global directory (all Node versions share one global package dir)
+    NPM_GLOBAL_DIR="$HOME/.npm-global"
+    echo "Configuring shared npm global directory at $NPM_GLOBAL_DIR..."
+    mkdir -p "$NPM_GLOBAL_DIR"
+    npm config set prefix "$NPM_GLOBAL_DIR" --global 2>/dev/null || true
+
+    # 6. Configure environment variables
     echo "Configuring environment variables..."
 
     NVM_ENV_BLOCK=$(cat <<EOF
@@ -58,6 +64,10 @@ install_nvm() {
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "\$NVM_DIR/bash_completion" ] && \. "\$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+# Shared npm global packages (works across all Node versions)
+export NPM_CONFIG_PREFIX="\$HOME/.npm-global"
+export PATH="\$HOME/.npm-global/bin:\$PATH"
 EOF
     )
 
@@ -97,6 +107,17 @@ EOF
 
 uninstall_nvm() {
     echo "Uninstalling NVM..."
+
+    # Remove shared npm global directory
+    NPM_GLOBAL_DIR="$HOME/.npm-global"
+    if [ -d "$NPM_GLOBAL_DIR" ]; then
+        rm -rf "$NPM_GLOBAL_DIR"
+        echo "Removed directory: $NPM_GLOBAL_DIR"
+    fi
+
+    # Remove npm global prefix config
+    npm config delete prefix --global 2>/dev/null || true
+
     if [ -d "$INSTALL_DIR" ]; then
         rm -rf "$INSTALL_DIR"
         echo "Removed directory: $INSTALL_DIR"
@@ -109,11 +130,12 @@ uninstall_nvm() {
     for CONF in "${SHELL_CONFIGS[@]}"; do
         if [ -f "$CONF" ]; then
             if grep -q "# NVM Configuration" "$CONF"; then
-                # Remove block starting with "# NVM Configuration" and ending with the bash_completion line
-                # Or simply remove 4 lines starting from match
-                # Using sed range delete
-                sed -i.bak '/# NVM Configuration/,/bash_completion/d' "$CONF" && rm "${CONF}.bak"
-                
+                # Remove block from "# NVM Configuration" to the last PATH line we added
+                # We match from "NVM Configuration" to just before a blank line that follows our block
+                sed -i.bak '/# NVM Configuration/,/NPM_CONFIG_PREFIX/d' "$CONF" && rm "${CONF}.bak"
+                # Also remove the PATH line we added
+                sed -i '/export PATH="\$HOME\/\.npm-global\/bin:\$PATH"/d' "$CONF"
+
                 echo "Removed configuration from $CONF"
                 USER_REMOVED_CONFIG=true
             elif grep -q 'export NVM_DIR="$HOME/.nvm"' "$CONF"; then
@@ -124,9 +146,9 @@ uninstall_nvm() {
 
     if [ "$USER_REMOVED_CONFIG" = false ]; then
          echo "No configuration found to remove or manual removal required."
-         echo "Please manually check your .bashrc/.zshrc for 'export NVM_DIR=...'"
+         echo "Please manually check your .bashrc/.zshrc for 'export NVM_DIR=...' and '~/.npm-global' references."
     fi
-    
+
     echo "NVM uninstallation completed."
 }
 
