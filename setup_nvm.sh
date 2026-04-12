@@ -49,11 +49,16 @@ install_nvm() {
         git -C "$INSTALL_DIR" checkout "$NVM_VERSION" --quiet
     fi
 
-    # 5. Configure shared npm global directory (all Node versions share one global package dir)
-    NPM_GLOBAL_DIR="$HOME/.npm-global"
-    echo "Configuring shared npm global directory at $NPM_GLOBAL_DIR..."
-    mkdir -p "$NPM_GLOBAL_DIR"
-    npm config set prefix "$NPM_GLOBAL_DIR" --global 2>/dev/null || true
+    # 5. Configure default-packages (auto-installed for every new Node version)
+    DEFAULT_PACKAGES_FILE="$INSTALL_DIR/default-packages"
+    if [ ! -f "$DEFAULT_PACKAGES_FILE" ]; then
+        echo "Creating default-packages file at $DEFAULT_PACKAGES_FILE..."
+        cat > "$DEFAULT_PACKAGES_FILE" <<PKGEOF
+# Packages listed here will be automatically installed when you run 'nvm install <version>'.
+# One package per line. You can pin versions with @, e.g. typescript@5
+PKGEOF
+        echo "Edit $DEFAULT_PACKAGES_FILE to add packages you want in every Node version."
+    fi
 
     # 6. Configure environment variables
     echo "Configuring environment variables..."
@@ -64,10 +69,6 @@ install_nvm() {
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "\$NVM_DIR/bash_completion" ] && \. "\$NVM_DIR/bash_completion"  # This loads nvm bash_completion
-
-# Shared npm global packages (works across all Node versions)
-export NPM_CONFIG_PREFIX="\$HOME/.npm-global"
-export PATH="\$HOME/.npm-global/bin:\$PATH"
 EOF
     )
 
@@ -108,15 +109,12 @@ EOF
 uninstall_nvm() {
     echo "Uninstalling NVM..."
 
-    # Remove shared npm global directory
-    NPM_GLOBAL_DIR="$HOME/.npm-global"
-    if [ -d "$NPM_GLOBAL_DIR" ]; then
-        rm -rf "$NPM_GLOBAL_DIR"
-        echo "Removed directory: $NPM_GLOBAL_DIR"
+    # Remove default-packages file
+    DEFAULT_PACKAGES_FILE="$INSTALL_DIR/default-packages"
+    if [ -f "$DEFAULT_PACKAGES_FILE" ]; then
+        rm -f "$DEFAULT_PACKAGES_FILE"
+        echo "Removed: $DEFAULT_PACKAGES_FILE"
     fi
-
-    # Remove npm global prefix config
-    npm config delete prefix --global 2>/dev/null || true
 
     if [ -d "$INSTALL_DIR" ]; then
         rm -rf "$INSTALL_DIR"
@@ -132,9 +130,7 @@ uninstall_nvm() {
             if grep -q "# NVM Configuration" "$CONF"; then
                 # Remove block from "# NVM Configuration" to the last PATH line we added
                 # We match from "NVM Configuration" to just before a blank line that follows our block
-                sed -i.bak '/# NVM Configuration/,/NPM_CONFIG_PREFIX/d' "$CONF" && rm "${CONF}.bak"
-                # Also remove the PATH line we added
-                sed -i '/export PATH="\$HOME\/\.npm-global\/bin:\$PATH"/d' "$CONF"
+                sed -i.bak '/# NVM Configuration/,/nvm bash_completion/d' "$CONF" && rm -f "${CONF}.bak"
 
                 echo "Removed configuration from $CONF"
                 USER_REMOVED_CONFIG=true
