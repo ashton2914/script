@@ -4,7 +4,7 @@
 
 Use GitHub source
 
-```
+```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ashton2914/script/refs/heads/main/[script_name.sh])"  
 ```
 
