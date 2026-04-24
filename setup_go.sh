@@ -72,14 +72,11 @@ install_go() {
     # 6. Configure environment variables
     echo "Configuring environment variables..."
 
-    GO_ENV_BLOCK=$(cat <<EOF
-
+    GO_ENV_BLOCK="
 # Go Environment (Rootless)
 export GOROOT=\$HOME/.local/go
 export GOPATH=\$HOME/go
-export PATH=\$PATH:\$GOROOT/bin:\$GOPATH/bin
-EOF
-    )
+export PATH=\$PATH:\$GOROOT/bin:\$GOPATH/bin"
 
     UPDATED_FILES=()
 
