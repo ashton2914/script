@@ -58,7 +58,10 @@ install_go() {
 
     # 4. Download and Extract
     echo "Downloading $DOWNLOAD_URL..."
-    wget -q --show-progress "$DOWNLOAD_URL"
+    if ! curl -fSL --progress-bar -o "$TAR_FILE" "$DOWNLOAD_URL"; then
+        echo "Error: Failed to download $DOWNLOAD_URL"
+        exit 1
+    fi
 
     echo "Extracting to $INSTALL_BASE..."
     tar -C "$INSTALL_BASE" -xzf "$TAR_FILE"
