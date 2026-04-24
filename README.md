@@ -2,6 +2,14 @@
 
 ## How to use
 
+Use GitHub source
+
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ashton2914/script/refs/heads/main/[script_name.sh])"  
+```
+
+or use ashtreetown.org source
+
 ```sh
 bash -c "$(curl -fsSL https://ashtreetown.org/resource/script/[script_name.sh])"
 ```
