@@ -82,15 +82,66 @@ extract_zip() {
     fi
 }
 
+# Download with sane network timeouts so a stalled mirror fails fast
+# instead of hanging forever. Tries each URL in turn until one succeeds.
+# Usage: download_with_fallback <output_file> <url1> [url2 ...]
+download_with_fallback() {
+    local out="$1"; shift
+    local url
+    for url in "$@"; do
+        [ -z "$url" ] && continue
+        echo "  -> $url"
+        if curl -fL --progress-bar \
+                --connect-timeout 15 \
+                --max-time 600 \
+                --retry 3 \
+                --retry-delay 2 \
+                --retry-connrefused \
+                -o "$out" "$url"; then
+            return 0
+        fi
+        echo "  (failed, trying next mirror if available...)"
+    done
+    return 1
+}
+
+# Best-effort lookup of the latest rclone version tag (e.g. "v1.66.0").
+# Falls back to "current" symlink naming when we cannot reach GitHub.
+latest_rclone_version() {
+    local v
+    v="$(curl -fsSL --connect-timeout 10 --max-time 20 \
+            https://api.github.com/repos/rclone/rclone/releases/latest 2>/dev/null \
+            | grep -m1 '"tag_name"' \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+    printf '%s' "$v"
+}
+
 install_rclone() {
     if [ -x "$RCLONE_BIN" ]; then return 0; fi
     need_curl
     mkdir -p "$INSTALL_BIN_DIR"
-    local tmp url
+    local tmp
     tmp="$(mktemp -d)"
-    url="https://downloads.rclone.org/rclone-current-${OS_TYPE}-${ARCH_TYPE}.zip"
-    echo "Downloading rclone from $url ..."
-    curl -fL --progress-bar -o "$tmp/rclone.zip" "$url"
+
+    # Build candidate URL list: env override > official > GitHub release mirror.
+    local urls=()
+    [ -n "$QUICKDAV_RCLONE_URL" ] && urls+=("$QUICKDAV_RCLONE_URL")
+    urls+=("https://downloads.rclone.org/rclone-current-${OS_TYPE}-${ARCH_TYPE}.zip")
+    local ver
+    ver="$(latest_rclone_version)"
+    if [ -n "$ver" ]; then
+        urls+=("https://github.com/rclone/rclone/releases/download/${ver}/rclone-${ver}-${OS_TYPE}-${ARCH_TYPE}.zip")
+    fi
+
+    echo "Downloading rclone (will try ${#urls[@]} source(s); set QUICKDAV_RCLONE_URL to override)..."
+    if ! download_with_fallback "$tmp/rclone.zip" "${urls[@]}"; then
+        echo "Error: failed to download rclone from all sources."
+        echo "Hint: set QUICKDAV_RCLONE_URL to a reachable mirror, or place a"
+        echo "      'rclone' binary at: $INSTALL_BIN_DIR/rclone"
+        rm -rf "$tmp"
+        exit 1
+    fi
+
     extract_zip "$tmp/rclone.zip" "$tmp"
     local found
     found="$(find "$tmp" -type f -name rclone | head -n 1)"
@@ -110,9 +161,19 @@ install_jq() {
     if [ -x "$JQ_BIN" ]; then return 0; fi
     need_curl
     mkdir -p "$INSTALL_BIN_DIR"
-    local url="https://github.com/jqlang/jq/releases/latest/download/jq-${JQ_OS}-${ARCH_TYPE}"
-    echo "Downloading jq from $url ..."
-    curl -fL --progress-bar -o "$INSTALL_BIN_DIR/jq" "$url"
+
+    local urls=()
+    [ -n "$QUICKDAV_JQ_URL" ] && urls+=("$QUICKDAV_JQ_URL")
+    urls+=("https://github.com/jqlang/jq/releases/latest/download/jq-${JQ_OS}-${ARCH_TYPE}")
+
+    echo "Downloading jq (will try ${#urls[@]} source(s); set QUICKDAV_JQ_URL to override)..."
+    if ! download_with_fallback "$INSTALL_BIN_DIR/jq" "${urls[@]}"; then
+        echo "Error: failed to download jq from all sources."
+        echo "Hint: set QUICKDAV_JQ_URL to a reachable mirror, or place a"
+        echo "      'jq' binary at: $INSTALL_BIN_DIR/jq"
+        rm -f "$INSTALL_BIN_DIR/jq"
+        exit 1
+    fi
     chmod +x "$INSTALL_BIN_DIR/jq"
     JQ_BIN="$INSTALL_BIN_DIR/jq"
     echo "jq installed at $JQ_BIN ($("$JQ_BIN" --version))"
@@ -170,26 +231,176 @@ is_running() {
     kill -0 "$pid" 2>/dev/null
 }
 
-check_fuse() {
+fuse_userland_present() {
     if [ "$OS_TYPE" = "linux" ]; then
-        if command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; then
-            return 0
-        fi
-        echo "Warning: FUSE userland not found."
-        echo "  On Debian/Ubuntu: install 'fuse3' package."
-        echo "  On RHEL/Fedora:   install 'fuse3' package."
-        echo "Mount will likely fail until FUSE is available."
-        return 0
+        command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1
     else
-        if [ -d /Library/Filesystems/macfuse.fs ] \
-           || [ -d /Library/Filesystems/osxfuse.fs ] \
-           || [ -d /Library/Filesystems/fuse-t.fs ]; then
-            return 0
-        fi
-        echo "Warning: macFUSE / FUSE-T not detected."
+        [ -d /Library/Filesystems/macfuse.fs ] \
+            || [ -d /Library/Filesystems/osxfuse.fs ] \
+            || [ -d /Library/Filesystems/fuse-t.fs ]
+    fi
+}
+
+# Detect Linux distro family for package manager hints / auto-install.
+# Echoes one of: debian | rhel | fedora | arch | suse | alpine | unknown
+linux_distro_family() {
+    local id="" like=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-}"
+        like="${ID_LIKE:-}"
+    fi
+    case " $id $like " in
+        *" debian "*|*" ubuntu "*) echo debian ;;
+        *" fedora "*)              echo fedora ;;
+        *" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) echo rhel ;;
+        *" arch "*|*" manjaro "*)  echo arch ;;
+        *" suse "*|*" opensuse "*) echo suse ;;
+        *" alpine "*)              echo alpine ;;
+        *)                         echo unknown ;;
+    esac
+}
+
+# Build the recommended install command for the FUSE userland on this Linux
+# distro. Echoes the command, or empty if unknown.
+fuse_install_command() {
+    case "$(linux_distro_family)" in
+        debian) echo "sudo apt-get update && sudo apt-get install -y fuse3" ;;
+        fedora) echo "sudo dnf install -y fuse3" ;;
+        rhel)   echo "sudo dnf install -y fuse3 || sudo yum install -y fuse3" ;;
+        arch)   echo "sudo pacman -S --noconfirm fuse3" ;;
+        suse)   echo "sudo zypper install -y fuse3" ;;
+        alpine) echo "sudo apk add fuse3" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Returns 0 if FUSE userland is ready (or was just installed), 1 otherwise.
+# May prompt the user to run a sudo install command on Linux.
+ensure_fuse() {
+    if fuse_userland_present; then
+        return 0
+    fi
+
+    if [ "$OS_TYPE" != "linux" ]; then
+        echo "Error: macFUSE / FUSE-T not detected."
         echo "  Install macFUSE: https://osxfuse.github.io/ (requires admin)"
         echo "  or FUSE-T:       https://www.fuse-t.org/"
+        return 1
+    fi
+
+    echo "Error: FUSE userland not found (need 'fusermount3' or 'fusermount')."
+    local cmd
+    cmd="$(fuse_install_command)"
+    if [ -z "$cmd" ]; then
+        echo "  Please install the 'fuse3' package using your distro's package manager,"
+        echo "  then retry the mount."
+        return 1
+    fi
+
+    echo "  Recommended install command:"
+    echo "      $cmd"
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "  'sudo' is not available; run the command above as root, then retry."
+        return 1
+    fi
+
+    local yn
+    read -rp "Run it now via sudo? [y/N] " yn
+    case "$yn" in
+        y|Y|yes|YES)
+            if bash -c "$cmd"; then
+                if fuse_userland_present; then
+                    echo "FUSE userland installed."
+                    return 0
+                fi
+                echo "Install command finished but 'fusermount3'/'fusermount' still not found."
+                return 1
+            else
+                echo "Install command failed (exit $?)."
+                return 1
+            fi
+            ;;
+        *)
+            echo "Skipped. Install 'fuse3' manually and retry the mount."
+            return 1
+            ;;
+    esac
+}
+
+# Returns 0 if the path is currently a mountpoint (including stale FUSE mounts).
+is_mountpoint() {
+    local p="$1"
+    [ -n "$p" ] || return 1
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$p" 2>/dev/null && return 0
+    fi
+    if [ -r /proc/self/mountinfo ]; then
+        awk -v p="$p" '$5 == p { found=1 } END { exit !found }' /proc/self/mountinfo \
+            && return 0
+    fi
+    return 1
+}
+
+# Robustly unmount a FUSE mount, escalating to lazy unmount for stale states
+# (e.g. when the backing rclone process died, leaving "Transport endpoint is
+# not connected"). Echoes a short status. Returns 0 on success.
+fuse_unmount() {
+    local p="$1"
+    [ -n "$p" ] || return 1
+    # Nothing to do if it is not a mountpoint at all.
+    if ! is_mountpoint "$p"; then
         return 0
+    fi
+
+    if [ "$OS_TYPE" = "linux" ]; then
+        local cmd=""
+        if command -v fusermount3 >/dev/null 2>&1; then cmd="fusermount3"
+        elif command -v fusermount  >/dev/null 2>&1; then cmd="fusermount"
+        fi
+        if [ -n "$cmd" ]; then
+            "$cmd" -u  "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+            "$cmd" -uz "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+        fi
+        umount    "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+        umount -l "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+    else
+        umount "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+        diskutil unmount force "$p" 2>/dev/null && ! is_mountpoint "$p" && return 0
+    fi
+    return 1
+}
+
+# Repair a stale mount point at an arbitrary path (not necessarily one of ours).
+clean_stale_mountpoint() {
+    local p
+    read -rp "Stale mount point to clean: " p
+    [ -z "$p" ] && { echo "Cancelled."; return; }
+    # Expand ~
+    case "$p" in
+        "~"|"~/"*) p="${HOME}${p#\~}" ;;
+    esac
+    if ! is_mountpoint "$p"; then
+        echo "Not a mountpoint: $p"
+        return
+    fi
+    if fuse_unmount "$p"; then
+        echo "Unmounted: $p"
+        local yn
+        read -rp "Remove empty directory '$p'? [y/N] " yn
+        case "$yn" in
+            y|Y|yes|YES)
+                if rmdir "$p" 2>/dev/null; then
+                    echo "Directory removed."
+                else
+                    echo "Could not rmdir (not empty or in use)."
+                fi
+                ;;
+        esac
+    else
+        echo "Failed to unmount '$p'."
+        echo "Try manually:  fusermount3 -uz '$p'   or   umount -l '$p'"
     fi
 }
 
@@ -547,7 +758,10 @@ mount_start() {
         return 1
     fi
 
-    check_fuse
+    if ! ensure_fuse; then
+        echo "Mount '$name' aborted: FUSE userland is not available."
+        return 1
+    fi
     mkdir -p "$point"
 
     # Use a connection string so we do not need to persist a rclone remote
@@ -582,14 +796,13 @@ mount_stop() {
     point="$(printf '%s' "$row" | jq -r '.mount_point')"
     pid_file="$(mount_pid_file "$name")"
 
-    if [ "$OS_TYPE" = "linux" ]; then
-        if command -v fusermount3 >/dev/null 2>&1; then
-            fusermount3 -u "$point" 2>/dev/null || true
-        elif command -v fusermount >/dev/null 2>&1; then
-            fusermount -u "$point" 2>/dev/null || true
+    if is_mountpoint "$point"; then
+        if fuse_unmount "$point"; then
+            :
+        else
+            echo "Warning: could not unmount '$point' cleanly."
+            echo "         Try manually:  fusermount3 -uz '$point'"
         fi
-    else
-        umount "$point" 2>/dev/null || diskutil unmount force "$point" 2>/dev/null || true
     fi
 
     if is_running "$pid_file"; then
@@ -636,6 +849,254 @@ refresh_all() {
         mount_start "$n" || true
     done
     echo "Refresh complete."
+}
+
+# ----------------- 9b. Maintenance (status / update / clear / uninstall) -----------------
+SCRIPT_PATH="$(canon_path "${BASH_SOURCE[0]:-$0}")"
+
+show_status() {
+    echo
+    echo "--- quickDAV status ---"
+    echo "  Config dir : $CONFIG_DIR"
+    echo "  Bin dir    : $INSTALL_BIN_DIR"
+    local rv jv
+    rv="$("$RCLONE_BIN" version 2>/dev/null | head -n 1)"
+    jv="$("$JQ_BIN" --version 2>/dev/null)"
+    echo "  rclone     : $RCLONE_BIN ${rv:+($rv)}"
+    echo "  jq         : $JQ_BIN ${jv:+($jv)}"
+
+    echo
+    echo "Credentials:"
+    cred_list
+
+    echo
+    echo "Shares:"
+    local sc
+    sc="$(jq 'length' "$SHARE_FILE")"
+    if [ "$sc" -eq 0 ]; then
+        echo "  (none)"
+    else
+        jq -r '.[] | "\(.name)\t\(.listen_host):\(.listen_port)\t\(.local_path)\t\(.credential)"' "$SHARE_FILE" | \
+        while IFS=$'\t' read -r n a p c; do
+            local pf state pid
+            pf="$(share_pid_file "$n")"
+            if is_running "$pf"; then state="running"; pid="$(cat "$pf")"; else state="stopped"; pid="-"; fi
+            printf "  - %s\n      addr   : http://%s/\n      path   : %s\n      cred   : %s\n      state  : %s (PID %s)\n      log    : %s\n" \
+                "$n" "$a" "$p" "$c" "$state" "$pid" "$(share_log_file "$n")"
+        done
+    fi
+
+    echo
+    echo "Mounts:"
+    local mc
+    mc="$(jq 'length' "$MOUNT_FILE")"
+    if [ "$mc" -eq 0 ]; then
+        echo "  (none)"
+    else
+        jq -r '.[] | "\(.name)\t\(.url)\t\(.mount_point)\t\(.credential)"' "$MOUNT_FILE" | \
+        while IFS=$'\t' read -r n u p c; do
+            local pf state pid
+            pf="$(mount_pid_file "$n")"
+            if is_running "$pf"; then state="mounted"; pid="$(cat "$pf")"; else state="unmounted"; pid="-"; fi
+            printf "  - %s\n      url    : %s\n      point  : %s\n      cred   : %s\n      state  : %s (PID %s)\n      log    : %s\n" \
+                "$n" "$u" "$p" "$c" "$state" "$pid" "$(mount_log_file "$n")"
+        done
+    fi
+    echo
+}
+
+# Print rclone short version (e.g. "v1.66.0"), empty on failure.
+rclone_short_version() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    "$bin" version 2>/dev/null | head -n 1 | awk '{print $2}'
+}
+
+update_rclone() {
+    need_curl
+    if [ ! -x "$RCLONE_BIN" ]; then
+        echo "rclone is not installed yet. Restart the script to bootstrap it."
+        return 1
+    fi
+    local cur_ver
+    cur_ver="$(rclone_short_version "$RCLONE_BIN")"
+    echo "Current rclone: $RCLONE_BIN (${cur_ver:-unknown})"
+
+    # If the active rclone is not the one we manage, do not overwrite it.
+    if [ "$RCLONE_BIN" != "$INSTALL_BIN_DIR/rclone" ]; then
+        echo
+        echo "This rclone is provided by your system (not managed by quickDAV)."
+        echo "Update it through your OS package manager, e.g.:"
+        echo "    sudo apt-get install --only-upgrade rclone"
+        local yn
+        read -rp "Install a private copy into '$INSTALL_BIN_DIR' instead? [y/N] " yn
+        case "$yn" in
+            y|Y|yes|YES) ;;
+            *) echo "Cancelled."; return 0 ;;
+        esac
+    fi
+
+    # Build URL list (mirrors install_rclone()).
+    local urls=()
+    [ -n "$QUICKDAV_RCLONE_URL" ] && urls+=("$QUICKDAV_RCLONE_URL")
+    urls+=("https://downloads.rclone.org/rclone-current-${OS_TYPE}-${ARCH_TYPE}.zip")
+    local latest
+    latest="$(latest_rclone_version)"
+    if [ -n "$latest" ]; then
+        urls+=("https://github.com/rclone/rclone/releases/download/${latest}/rclone-${latest}-${OS_TYPE}-${ARCH_TYPE}.zip")
+    fi
+
+    local tmp
+    tmp="$(mktemp -d)"
+    mkdir -p "$INSTALL_BIN_DIR"
+
+    echo "Downloading rclone (will try ${#urls[@]} source(s); set QUICKDAV_RCLONE_URL to override)..."
+    if ! download_with_fallback "$tmp/rclone.zip" "${urls[@]}"; then
+        echo "Update failed: could not download rclone from any source."
+        rm -rf "$tmp"
+        return 1
+    fi
+    extract_zip "$tmp/rclone.zip" "$tmp"
+    local found
+    found="$(find "$tmp" -type f -name rclone | head -n 1)"
+    if [ -z "$found" ]; then
+        echo "Update failed: rclone binary not found in archive."
+        rm -rf "$tmp"
+        return 1
+    fi
+    chmod +x "$found"
+    local new_ver
+    new_ver="$(rclone_short_version "$found")"
+    echo "Downloaded rclone: ${new_ver:-unknown}"
+
+    # If we're replacing the SAME path with the SAME version, skip.
+    if [ "$RCLONE_BIN" = "$INSTALL_BIN_DIR/rclone" ] \
+       && [ -n "$cur_ver" ] && [ -n "$new_ver" ] && [ "$cur_ver" = "$new_ver" ]; then
+        echo "Already up to date: $cur_ver"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    # Heads-up about live processes still holding the old binary.
+    local running=0 pf
+    if [ -d "$RUN_DIR" ]; then
+        for pf in "$RUN_DIR"/*.pid; do
+            [ -f "$pf" ] || continue
+            is_running "$pf" && running=$((running + 1))
+        done
+    fi
+
+    # Backup any previous private copy we are about to replace.
+    if [ -f "$INSTALL_BIN_DIR/rclone" ]; then
+        local bak="$INSTALL_BIN_DIR/rclone.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$INSTALL_BIN_DIR/rclone" "$bak"
+        echo "Backed up old binary to: $bak"
+    fi
+
+    if ! mv "$found" "$INSTALL_BIN_DIR/rclone"; then
+        echo "Update failed: could not install new rclone binary."
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    RCLONE_BIN="$INSTALL_BIN_DIR/rclone"
+
+    echo "rclone updated: ${cur_ver:-unknown} -> ${new_ver:-unknown}"
+    echo "Active path   : $RCLONE_BIN"
+    if [ "$running" -gt 0 ]; then
+        echo "Note: $running running share/mount process(es) still use the old binary."
+        echo "      Use option 6 (Refresh) to restart them with the new version."
+    fi
+    if [[ ":$PATH:" != *":$INSTALL_BIN_DIR:"* ]]; then
+        echo "Hint: '$INSTALL_BIN_DIR' is not on PATH; add it so 'rclone' on your"
+        echo "      shell refers to this version:"
+        echo "          export PATH=\"$INSTALL_BIN_DIR:\$PATH\""
+    fi
+}
+
+clear_all_shares() {
+    local cnt
+    cnt="$(jq 'length' "$SHARE_FILE")"
+    if [ "$cnt" -eq 0 ]; then
+        echo "No shares to clear."
+        return
+    fi
+    echo "This will STOP and DELETE all $cnt share(s)."
+    local yn
+    read -rp "Type 'yes' to confirm: " yn
+    [ "$yn" = "yes" ] || { echo "Cancelled."; return; }
+    local n
+    for n in $(jq -r '.[].name' "$SHARE_FILE"); do
+        share_stop "$n" || true
+    done
+    json_write "$SHARE_FILE" '[]'
+    rm -f "$RUN_DIR"/share-*.pid
+    echo "All shares cleared."
+}
+
+clear_all_mounts() {
+    local cnt
+    cnt="$(jq 'length' "$MOUNT_FILE")"
+    if [ "$cnt" -eq 0 ]; then
+        echo "No mounts to clear."
+        return
+    fi
+    echo "This will UNMOUNT and DELETE all $cnt mount(s)."
+    local yn
+    read -rp "Type 'yes' to confirm: " yn
+    [ "$yn" = "yes" ] || { echo "Cancelled."; return; }
+    local n
+    for n in $(jq -r '.[].name' "$MOUNT_FILE"); do
+        mount_stop "$n" || true
+    done
+    json_write "$MOUNT_FILE" '[]'
+    rm -f "$RUN_DIR"/mount-*.pid
+    echo "All mounts cleared."
+}
+
+uninstall_all() {
+    echo "This will:"
+    echo "  - Stop all running shares and mounts"
+    echo "  - Delete config directory: $CONFIG_DIR"
+    local will_rm_rclone="no" will_rm_jq="no"
+    if [ "$RCLONE_BIN" = "$INSTALL_BIN_DIR/rclone" ] && [ -x "$INSTALL_BIN_DIR/rclone" ]; then
+        echo "  - Remove private rclone binary: $INSTALL_BIN_DIR/rclone"
+        will_rm_rclone="yes"
+    fi
+    if [ "$JQ_BIN" = "$INSTALL_BIN_DIR/jq" ] && [ -x "$INSTALL_BIN_DIR/jq" ]; then
+        echo "  - Remove private jq binary:     $INSTALL_BIN_DIR/jq"
+        will_rm_jq="yes"
+    fi
+    local yn
+    read -rp "Type 'yes' to confirm uninstall: " yn
+    [ "$yn" = "yes" ] || { echo "Cancelled."; return; }
+
+    local n
+    if [ -f "$MOUNT_FILE" ]; then
+        for n in $(jq -r '.[].name' "$MOUNT_FILE" 2>/dev/null); do
+            mount_stop "$n" || true
+        done
+    fi
+    if [ -f "$SHARE_FILE" ]; then
+        for n in $(jq -r '.[].name' "$SHARE_FILE" 2>/dev/null); do
+            share_stop "$n" || true
+        done
+    fi
+
+    rm -rf "$CONFIG_DIR"
+    [ "$will_rm_rclone" = "yes" ] && rm -f "$INSTALL_BIN_DIR/rclone"
+    [ "$will_rm_jq"     = "yes" ] && rm -f "$INSTALL_BIN_DIR/jq"
+
+    echo "Uninstall complete."
+    if [ -f "$SCRIPT_PATH" ]; then
+        local yn2
+        read -rp "Also remove this script ($SCRIPT_PATH)? [y/N] " yn2
+        case "$yn2" in
+            y|Y|yes|YES) rm -f "$SCRIPT_PATH" && echo "Script removed." ;;
+            *) echo "Script kept at: $SCRIPT_PATH" ;;
+        esac
+    fi
+    exit 0
 }
 
 # ----------------- 10. Sub-menus -----------------
@@ -702,6 +1163,7 @@ menu_mounts() {
         echo " 2) Unmount"
         echo " 3) Delete a mount"
         echo " 4) Show mount log"
+        echo " 5) Clean stale mountpoint (fix 'Transport endpoint is not connected')"
         echo " 0) Back"
         local c n
         read -rp "Select> " c
@@ -714,6 +1176,7 @@ menu_mounts() {
                    local f; f="$(mount_log_file "$n")"
                    if [ -f "$f" ]; then tail -n 40 "$f"; else echo "No log: $f"; fi
                } ;;
+            5) clean_stale_mountpoint ;;
             0|"") set -e; return ;;
             *) echo "Invalid choice." ;;
         esac
@@ -729,25 +1192,35 @@ main_menu() {
         echo " quickDAV - WebDAV Share/Mount Manager"
         echo " Config: $CONFIG_DIR"
         echo "============================================="
-        echo " 1) Manage Credentials"
-        echo " 2) Share          (create a new share)"
-        echo " 3) Manage Shares  (list / start / stop / delete)"
-        echo " 4) Mount          (create a new mount)"
-        echo " 5) Manage Mounts  (list / mount / unmount / delete)"
-        echo " 6) Refresh shares and mounts"
-        echo " 0) Exit"
+        echo "  1) Manage Credentials"
+        echo "  2) Share          (create a new share)"
+        echo "  3) Manage Shares  (list / start / stop / delete)"
+        echo "  4) Mount          (create a new mount)"
+        echo "  5) Manage Mounts  (list / mount / unmount / delete)"
+        echo "  6) Refresh shares and mounts"
+        echo "  7) Show status"
+        echo " 88) Update rclone"
+        echo " 91) Clear ALL shares"
+        echo " 92) Clear ALL mounts"
+        echo " 99) Uninstall quickDAV"
+        echo "  0) Exit"
         echo "============================================="
         local c
-        read -rp "Select [0-6]: " c
+        read -rp "Select: " c
         case "$c" in
-            1) menu_credentials ;;
-            2) share_create ;;
-            3) menu_shares ;;
-            4) mount_create ;;
-            5) menu_mounts ;;
-            6) refresh_all ;;
+            1)  menu_credentials ;;
+            2)  share_create ;;
+            3)  menu_shares ;;
+            4)  mount_create ;;
+            5)  menu_mounts ;;
+            6)  refresh_all ;;
+            7)  show_status ;;
+            88) update_rclone ;;
+            91) clear_all_shares ;;
+            92) clear_all_mounts ;;
+            99) uninstall_all ;;
             0|"") echo "Bye."; exit 0 ;;
-            *) echo "Invalid choice." ;;
+            *)  echo "Invalid choice." ;;
         esac
     done
 }
