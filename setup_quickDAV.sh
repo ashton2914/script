@@ -630,9 +630,25 @@ share_start() {
     # Pass user/pass via environment to avoid exposing them via `ps`.
     # rclone honours RCLONE_<UPPER_FLAG> env vars.
     : > "$log_file"
+    # VFS tuning notes:
+    #   --dir-cache-time 1s  : default is 5m; that causes WebDAV clients
+    #                          (e.g. Obsidian Remotely Save) to see stale
+    #                          Last-Modified headers when the underlying
+    #                          tree changes. 1s is effectively "always fresh"
+    #                          while still de-duplicating bursts of PROPFIND
+    #                          calls. Dir cache is lazy-refreshed on access,
+    #                          so an idle server costs nothing.
+    #   --vfs-refresh        : prime the dir cache on startup so the very
+    #                          first PROPFIND already sees the full tree.
+    #   --etag-hash auto     : let rclone compute an ETag from the backend's
+    #                          hash, which gives WebDAV clients a stable way
+    #                          to detect content changes alongside mtime.
     RCLONE_USER="$user" RCLONE_PASS="$pass" \
         nohup "$RCLONE_BIN" serve webdav "$path" \
             --addr "${host}:${port}" \
+            --dir-cache-time 1s \
+            --vfs-refresh \
+            --etag-hash auto \
             --log-file "$log_file" \
             --log-level INFO \
             </dev/null >>"$log_file" 2>&1 &
@@ -770,8 +786,12 @@ mount_start() {
     conn=":webdav,url='${url}',vendor='other',user='${user}',pass='${pass}':"
 
     : > "$log_file"
+    # Mirror the serve-side cache tuning so the FUSE view also picks up
+    # remote changes within a second rather than minutes.
     nohup "$RCLONE_BIN" mount "$conn" "$point" \
         --vfs-cache-mode writes \
+        --dir-cache-time 1s \
+        --vfs-refresh \
         --log-file "$log_file" \
         --log-level INFO \
         </dev/null >>"$log_file" 2>&1 &
