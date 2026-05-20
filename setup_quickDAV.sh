@@ -852,7 +852,84 @@ refresh_all() {
 }
 
 # ----------------- 9b. Maintenance (status / update / clear / uninstall) -----------------
-SCRIPT_PATH="$(canon_path "${BASH_SOURCE[0]:-$0}")"
+# SCRIPT_PATH: absolute path of the running script, or empty when started via
+# 'curl ... | bash' (BASH_SOURCE[0] is empty there). Many maintenance ops
+# need a real on-disk file; they use ensure_local_script to install one when
+# SCRIPT_PATH is empty.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_PATH="$(canon_path "${BASH_SOURCE[0]}")"
+else
+    SCRIPT_PATH=""
+fi
+LOCAL_SCRIPT_PATH="$INSTALL_BIN_DIR/setup_quickDAV.sh"
+DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/ashton2914/script/main/setup_quickDAV.sh"
+
+# Install (or refresh) a local copy of this script at $LOCAL_SCRIPT_PATH.
+# Source selection:
+#   1. If we are already running from $LOCAL_SCRIPT_PATH       -> no-op.
+#   2. If SCRIPT_PATH points at an on-disk script elsewhere    -> copy it.
+#   3. Otherwise (curl|bash, or file missing)                  -> download
+#      from $QUICKDAV_SCRIPT_URL (defaults to $DEFAULT_SCRIPT_URL).
+install_local_script() {
+    mkdir -p "$INSTALL_BIN_DIR"
+    local tmp source_desc
+    tmp="$(mktemp)"
+
+    if [ -n "$SCRIPT_PATH" ] && [ "$SCRIPT_PATH" = "$LOCAL_SCRIPT_PATH" ] && [ -f "$LOCAL_SCRIPT_PATH" ]; then
+        echo "Already installed: $LOCAL_SCRIPT_PATH (currently running from it)."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+        cp "$SCRIPT_PATH" "$tmp"
+        source_desc="copied from $SCRIPT_PATH"
+    else
+        need_curl
+        local url="${QUICKDAV_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
+        echo "Downloading setup_quickDAV.sh (set QUICKDAV_SCRIPT_URL to override)..."
+        if ! download_with_fallback "$tmp" "$url"; then
+            echo "Failed to download script from $url"
+            rm -f "$tmp"
+            return 1
+        fi
+        source_desc="downloaded from $url"
+    fi
+
+    if [ ! -s "$tmp" ] || ! head -n 1 "$tmp" | grep -q '^#!' \
+       || ! bash -n "$tmp" 2>/dev/null; then
+        echo "Script validation failed (empty, missing shebang, or syntax error)."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! mv "$tmp" "$LOCAL_SCRIPT_PATH"; then
+        echo "Failed to write $LOCAL_SCRIPT_PATH"
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod +x "$LOCAL_SCRIPT_PATH"
+    echo "Installed local script ($source_desc):"
+    echo "  $LOCAL_SCRIPT_PATH"
+    return 0
+}
+
+# Return (via stdout) a path to an executable copy of this script on disk,
+# installing $LOCAL_SCRIPT_PATH if necessary. Returns non-zero on failure.
+ensure_local_script() {
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ] && [ -x "$SCRIPT_PATH" ]; then
+        printf '%s' "$SCRIPT_PATH"
+        return 0
+    fi
+    if [ -f "$LOCAL_SCRIPT_PATH" ] && [ -x "$LOCAL_SCRIPT_PATH" ]; then
+        printf '%s' "$LOCAL_SCRIPT_PATH"
+        return 0
+    fi
+    echo "No on-disk script found (running via curl|bash?)." >&2
+    echo "Installing a local copy first..." >&2
+    install_local_script >&2 || return 1
+    printf '%s' "$LOCAL_SCRIPT_PATH"
+}
 
 show_status() {
     echo
@@ -1056,9 +1133,10 @@ clear_all_mounts() {
 
 uninstall_all() {
     echo "This will:"
+    echo "  - Disable autostart (if enabled)"
     echo "  - Stop all running shares and mounts"
     echo "  - Delete config directory: $CONFIG_DIR"
-    local will_rm_rclone="no" will_rm_jq="no"
+    local will_rm_rclone="no" will_rm_jq="no" will_rm_local="no"
     if [ "$RCLONE_BIN" = "$INSTALL_BIN_DIR/rclone" ] && [ -x "$INSTALL_BIN_DIR/rclone" ]; then
         echo "  - Remove private rclone binary: $INSTALL_BIN_DIR/rclone"
         will_rm_rclone="yes"
@@ -1067,9 +1145,15 @@ uninstall_all() {
         echo "  - Remove private jq binary:     $INSTALL_BIN_DIR/jq"
         will_rm_jq="yes"
     fi
+    if [ -f "$LOCAL_SCRIPT_PATH" ]; then
+        echo "  - Remove local script copy:     $LOCAL_SCRIPT_PATH"
+        will_rm_local="yes"
+    fi
     local yn
     read -rp "Type 'yes' to confirm uninstall: " yn
     [ "$yn" = "yes" ] || { echo "Cancelled."; return; }
+
+    autostart_disable >/dev/null 2>&1 || true
 
     local n
     if [ -f "$MOUNT_FILE" ]; then
@@ -1086,9 +1170,10 @@ uninstall_all() {
     rm -rf "$CONFIG_DIR"
     [ "$will_rm_rclone" = "yes" ] && rm -f "$INSTALL_BIN_DIR/rclone"
     [ "$will_rm_jq"     = "yes" ] && rm -f "$INSTALL_BIN_DIR/jq"
+    [ "$will_rm_local"  = "yes" ] && rm -f "$LOCAL_SCRIPT_PATH"
 
     echo "Uninstall complete."
-    if [ -f "$SCRIPT_PATH" ]; then
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ] && [ "$SCRIPT_PATH" != "$LOCAL_SCRIPT_PATH" ]; then
         local yn2
         read -rp "Also remove this script ($SCRIPT_PATH)? [y/N] " yn2
         case "$yn2" in
@@ -1097,6 +1182,205 @@ uninstall_all() {
         esac
     fi
     exit 0
+}
+
+# ----------------- 9c. Non-interactive boot mode -----------------
+# Start every configured share and mount, then exit. Used by systemd/launchd.
+boot_start_all() {
+    set +e
+    echo "[quickDAV] boot: starting all shares and mounts..."
+    local n started=0 failed=0
+    if [ -f "$SHARE_FILE" ]; then
+        for n in $(jq -r '.[].name' "$SHARE_FILE" 2>/dev/null); do
+            if share_start "$n"; then started=$((started + 1)); else failed=$((failed + 1)); fi
+        done
+    fi
+    if [ -f "$MOUNT_FILE" ]; then
+        for n in $(jq -r '.[].name' "$MOUNT_FILE" 2>/dev/null); do
+            if mount_start "$n"; then started=$((started + 1)); else failed=$((failed + 1)); fi
+        done
+    fi
+    echo "[quickDAV] boot: done ($started started, $failed failed)."
+    set -e
+    return 0
+}
+
+# Stop everything (used as systemd ExecStop).
+boot_stop_all() {
+    set +e
+    echo "[quickDAV] shutdown: stopping all mounts and shares..."
+    local n
+    if [ -f "$MOUNT_FILE" ]; then
+        for n in $(jq -r '.[].name' "$MOUNT_FILE" 2>/dev/null); do
+            mount_stop "$n" || true
+        done
+    fi
+    if [ -f "$SHARE_FILE" ]; then
+        for n in $(jq -r '.[].name' "$SHARE_FILE" 2>/dev/null); do
+            share_stop "$n" || true
+        done
+    fi
+    echo "[quickDAV] shutdown: done."
+    set -e
+    return 0
+}
+
+# ----------------- 9d. Autostart (systemd user / launchd) -----------------
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_UNIT_NAME="quickdav.service"
+SYSTEMD_UNIT_PATH="$SYSTEMD_USER_DIR/$SYSTEMD_UNIT_NAME"
+LAUNCHD_LABEL="com.user.quickdav"
+LAUNCHD_PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+autostart_supported() {
+    if [ "$OS_TYPE" = "linux" ]; then
+        command -v systemctl >/dev/null 2>&1
+    else
+        command -v launchctl >/dev/null 2>&1
+    fi
+}
+
+autostart_unit_path() {
+    if [ "$OS_TYPE" = "linux" ]; then echo "$SYSTEMD_UNIT_PATH"; else echo "$LAUNCHD_PLIST_PATH"; fi
+}
+
+autostart_status() {
+    if ! autostart_supported; then
+        echo "  Autostart not supported on this system."
+        return 1
+    fi
+    if [ "$OS_TYPE" = "linux" ]; then
+        if [ -f "$SYSTEMD_UNIT_PATH" ]; then
+            echo "  Unit file : $SYSTEMD_UNIT_PATH (installed)"
+        else
+            echo "  Unit file : not installed"
+        fi
+        if systemctl --user is-enabled "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1; then
+            echo "  Enabled   : yes"
+        else
+            echo "  Enabled   : no"
+        fi
+        if systemctl --user is-active "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1; then
+            echo "  Active    : yes"
+        else
+            echo "  Active    : no"
+        fi
+        if loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
+            echo "  Linger    : yes  (runs at machine boot, before login)"
+        else
+            echo "  Linger    : no   (only starts after first user login)"
+            echo "              Enable with:  sudo loginctl enable-linger $USER"
+        fi
+    else
+        if [ -f "$LAUNCHD_PLIST_PATH" ]; then
+            echo "  Plist     : $LAUNCHD_PLIST_PATH (installed)"
+        else
+            echo "  Plist     : not installed"
+        fi
+        if launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"; then
+            echo "  Loaded    : yes"
+        else
+            echo "  Loaded    : no"
+        fi
+    fi
+}
+
+autostart_enable() {
+    if ! autostart_supported; then
+        echo "Autostart not supported on this system."
+        return 1
+    fi
+    local effective_script
+    effective_script="$(ensure_local_script)" || {
+        echo "Cannot enable autostart without a local script copy."
+        return 1
+    }
+    chmod +x "$effective_script" 2>/dev/null || true
+
+    if [ "$OS_TYPE" = "linux" ]; then
+        mkdir -p "$SYSTEMD_USER_DIR"
+        cat > "$SYSTEMD_UNIT_PATH" <<EOF
+[Unit]
+Description=quickDAV - WebDAV shares and mounts (rclone)
+After=default.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=${INSTALL_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${effective_script} --boot
+ExecStop=${effective_script} --stop-all
+
+[Install]
+WantedBy=default.target
+EOF
+        chmod 644 "$SYSTEMD_UNIT_PATH"
+        systemctl --user daemon-reload
+        if systemctl --user enable --now "$SYSTEMD_UNIT_NAME"; then
+            echo "Autostart enabled: $SYSTEMD_UNIT_PATH"
+            echo "             via: $effective_script"
+        else
+            echo "Warning: 'systemctl --user enable --now' returned non-zero."
+            echo "         Check:  systemctl --user status $SYSTEMD_UNIT_NAME"
+        fi
+        if ! loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
+            echo
+            echo "Note: services only start after you log in for the first time."
+            echo "      To start at machine boot, enable linger (one-time, needs sudo):"
+            echo "          sudo loginctl enable-linger $USER"
+        fi
+    else
+        mkdir -p "$(dirname "$LAUNCHD_PLIST_PATH")"
+        mkdir -p "$LOG_DIR"
+        cat > "$LAUNCHD_PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${effective_script}</string>
+        <string>--boot</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>${INSTALL_BIN_DIR}:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StandardOutPath</key><string>${LOG_DIR}/autostart.log</string>
+    <key>StandardErrorPath</key><string>${LOG_DIR}/autostart.log</string>
+</dict>
+</plist>
+EOF
+        launchctl unload "$LAUNCHD_PLIST_PATH" 2>/dev/null || true
+        if launchctl load "$LAUNCHD_PLIST_PATH"; then
+            echo "Autostart enabled: $LAUNCHD_PLIST_PATH"
+            echo "             via: $effective_script"
+        else
+            echo "Failed to load LaunchAgent."
+            return 1
+        fi
+    fi
+}
+
+autostart_disable() {
+    if ! autostart_supported; then
+        echo "Autostart not supported on this system."
+        return 1
+    fi
+    if [ "$OS_TYPE" = "linux" ]; then
+        systemctl --user disable --now "$SYSTEMD_UNIT_NAME" 2>/dev/null || true
+        rm -f "$SYSTEMD_UNIT_PATH"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "Autostart disabled."
+    else
+        launchctl unload "$LAUNCHD_PLIST_PATH" 2>/dev/null || true
+        rm -f "$LAUNCHD_PLIST_PATH"
+        echo "Autostart disabled."
+    fi
 }
 
 # ----------------- 10. Sub-menus -----------------
@@ -1183,6 +1467,34 @@ menu_mounts() {
     done
 }
 
+menu_autostart() {
+    set +e
+    while true; do
+        echo
+        echo "--- Autostart (run at boot/login) ---"
+        autostart_status
+        echo
+        echo " 1) Enable autostart"
+        echo " 2) Disable autostart"
+        echo " 3) Show unit/plist path"
+        echo " 4) View unit/plist contents"
+        echo " 5) Install / refresh local script copy ($LOCAL_SCRIPT_PATH)"
+        echo " 0) Back"
+        local c f
+        read -rp "Select> " c
+        case "$c" in
+            1) autostart_enable ;;
+            2) autostart_disable ;;
+            3) autostart_unit_path ;;
+            4) f="$(autostart_unit_path)"
+               if [ -f "$f" ]; then cat "$f"; else echo "Not installed: $f"; fi ;;
+            5) install_local_script ;;
+            0|"") set -e; return ;;
+            *) echo "Invalid choice." ;;
+        esac
+    done
+}
+
 # ----------------- 11. Main menu -----------------
 main_menu() {
     set +e
@@ -1199,6 +1511,7 @@ main_menu() {
         echo "  5) Manage Mounts  (list / mount / unmount / delete)"
         echo "  6) Refresh shares and mounts"
         echo "  7) Show status"
+        echo "  8) Manage Autostart (run at boot/login)"
         echo " 88) Update rclone"
         echo " 91) Clear ALL shares"
         echo " 92) Clear ALL mounts"
@@ -1215,6 +1528,7 @@ main_menu() {
             5)  menu_mounts ;;
             6)  refresh_all ;;
             7)  show_status ;;
+            8)  menu_autostart ;;
             88) update_rclone ;;
             91) clear_all_shares ;;
             92) clear_all_mounts ;;
@@ -1228,6 +1542,38 @@ main_menu() {
 # ----------------- 12. Bootstrap -----------------
 ensure_dependencies
 ensure_config
+
+# Non-interactive entry points (used by systemd/launchd autostart units).
+case "${1:-}" in
+    --boot|boot|start-all)
+        boot_start_all
+        exit 0
+        ;;
+    --stop-all|stop-all)
+        boot_stop_all
+        exit 0
+        ;;
+    --help|-h|help)
+        cat <<USAGE
+Usage: $0 [OPTION]
+
+With no arguments, launches the interactive menu.
+
+  --boot, start-all   Start all configured shares and mounts (non-interactive).
+  --stop-all          Stop all running shares and mounts.
+  --help              Show this message.
+USAGE
+        exit 0
+        ;;
+    "")
+        : # fall through to interactive
+        ;;
+    *)
+        echo "Unknown argument: $1"
+        echo "Run '$0 --help' for usage."
+        exit 1
+        ;;
+esac
 
 # Reminder if our private bin dir is not yet on PATH
 if [[ ":$PATH:" != *":$INSTALL_BIN_DIR:"* ]] && \
