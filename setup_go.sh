@@ -33,16 +33,36 @@ INSTALL_BASE="$HOME/.local"
 GOROOT_DIR="$INSTALL_BASE/go"
 SHELL_CONFIGS=("$HOME/.bashrc" "$HOME/.zshrc")
 
-install_go() {
-    # 1. Fetch the latest Go version
-    echo "Checking for the latest Go version..."
-    GO_VERSION=$(curl -s https://go.dev/dl/?mode=json | grep -o 'go[0-9.]*' | head -n 1)
+select_go_version() {
+    read -p "Enter Go version (e.g. 1.24.6, leave blank for latest): " REQUESTED_VERSION
 
-    if [ -z "$GO_VERSION" ]; then
-        echo "Error: Could not fetch the latest Go version."
-        exit 1
+    if [ -z "$REQUESTED_VERSION" ]; then
+        # 1. Fetch the latest Go version
+        echo "Checking for the latest Go version..."
+        GO_VERSION=$(curl -s https://go.dev/dl/?mode=json | grep -o 'go[0-9.]*' | head -n 1)
+
+        if [ -z "$GO_VERSION" ]; then
+            echo "Error: Could not fetch the latest Go version."
+            exit 1
+        fi
+        echo "Latest version found: $GO_VERSION"
+    else
+        REQUESTED_VERSION=${REQUESTED_VERSION#go}
+        if [[ ! "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid Go version. Use a version such as 1.24.6 or go1.24.6."
+            exit 1
+        fi
+        GO_VERSION="go${REQUESTED_VERSION}"
+        echo "Requested version: $GO_VERSION"
     fi
-    echo "Latest version found: $GO_VERSION"
+}
+
+install_go() {
+    if [ "$#" -eq 0 ]; then
+        select_go_version
+    else
+        GO_VERSION="$1"
+    fi
 
     TAR_FILE="${GO_VERSION}.${OS_TYPE}-${ARCH_TYPE}.tar.gz"
     DOWNLOAD_URL="https://go.dev/dl/${TAR_FILE}"
@@ -151,8 +171,10 @@ uninstall_go() {
 
 repair_go() {
     echo "Repairing Go..."
+    select_go_version
+    local REPAIR_VERSION="$GO_VERSION"
     uninstall_go
-    install_go
+    install_go "$REPAIR_VERSION"
 }
 
 echo "Choose an option:"
